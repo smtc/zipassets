@@ -5,25 +5,35 @@ import (
 	"archive/zip"
 	"compress/bzip2"
 	"compress/gzip"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"mime"
 	"net/http"
+	"net/textproto"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
 
+type filecontent struct {
+	name         string
+	isDir        bool
+	lastModified time.Time
+	content      []byte
+}
+
 type ZipAssets struct {
 	path  string
-	files map[string][]byte
+	files map[string]*filecontent
 }
 
 // open zip assets file
 func NewZipAssets(path string) (za *ZipAssets, err error) {
-	za = &ZipAssets{path, make(map[string][]byte)}
+	za = &ZipAssets{path, make(map[string]*filecontent)}
 	lowerPath := strings.ToLower(path)
 	if strings.HasSuffix(lowerPath, "zip") {
 		err = openZip(za)
@@ -39,11 +49,9 @@ func NewZipAssets(path string) (za *ZipAssets, err error) {
 // deal with .tar.gz
 func openTarGz(za *ZipAssets) (err error) {
 	var (
-		f     *os.File
-		tr    *tar.Reader
-		gr    *gzip.Reader
-		hdr   *tar.Header
-		bytes []byte
+		f  *os.File
+		tr *tar.Reader
+		gr *gzip.Reader
 	)
 
 	if f, err = os.Open(za.path); err != nil {
@@ -58,18 +66,7 @@ func openTarGz(za *ZipAssets) (err error) {
 
 	tr = tar.NewReader(gr)
 
-	for {
-		if hdr, err = tr.Next(); err == io.EOF {
-			break
-		}
-		if err != nil {
-			return
-		}
-		if bytes, err = ioutil.ReadAll(tr); err != nil {
-			return
-		}
-		za.files[hdr.Name] = bytes
-	}
+	err = openTar(za, tr)
 
 	return
 }
@@ -77,10 +74,8 @@ func openTarGz(za *ZipAssets) (err error) {
 // deal with .tar.bz2
 func openTarBz2(za *ZipAssets) (err error) {
 	var (
-		f     *os.File
-		tr    *tar.Reader
-		hdr   *tar.Header
-		bytes []byte
+		f  *os.File
+		tr *tar.Reader
 	)
 
 	if f, err = os.Open(za.path); err != nil {
@@ -90,6 +85,17 @@ func openTarBz2(za *ZipAssets) (err error) {
 
 	tr = tar.NewReader(bzip2.NewReader(f))
 
+	err = openTar(za, tr)
+
+	return
+}
+
+func openTar(za *ZipAssets, tr *tar.Reader) (err error) {
+	var (
+		hdr *tar.Header
+		fc  filecontent
+	)
+
 	for {
 		if hdr, err = tr.Next(); err == io.EOF {
 			break
@@ -97,19 +103,24 @@ func openTarBz2(za *ZipAssets) (err error) {
 		if err != nil {
 			return
 		}
-		if bytes, err = ioutil.ReadAll(tr); err != nil {
+		if fc.content, err = ioutil.ReadAll(tr); err != nil {
 			return
 		}
-		za.files[hdr.Name] = bytes
+		fc.name = hdr.Name
+		fc.lastModified = hdr.ModTime
+		fc.isDir = hdr.FileInfo().IsDir()
+		za.files[hdr.Name] = &fc
 	}
 
 	return
 }
 
+// deal zip file
 func openZip(za *ZipAssets) (err error) {
 	var (
 		bytes []byte
 		rc    io.ReadCloser
+		fc    filecontent
 	)
 
 	r, err := zip.OpenReader(za.path)
@@ -130,7 +141,10 @@ func openZip(za *ZipAssets) (err error) {
 		if err != nil {
 			return
 		}
-		za.files[f.Name] = bytes
+		fc.name = f.Name
+		fc.lastModified = f.ModTime()
+		fc.content = bytes
+		za.files[f.Name] = &fc
 	}
 
 	return
@@ -143,9 +157,18 @@ func (za *ZipAssets) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	if strings.HasPrefix(upath, "/") {
 		upath = upath[1:]
 	}
-	content, ok := za.files[upath]
+	fc, ok := za.files[upath]
 	if !ok {
 		http.NotFound(rw, req)
+		return
+	}
+
+	if checkLastModified(rw, req, fc.lastModified) {
+		return
+	}
+
+	rangeReq, done := checkETag(rw, req)
+	if done {
 		return
 	}
 	// If Content-Type isn't set, use the file's extension to find it, but
@@ -161,20 +184,21 @@ func (za *ZipAssets) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 				n   int
 				buf []byte
 			)
-			if len(content) >= 512 {
+			if len(fc.content) >= 512 {
 				n = 512
 			} else {
-				n = len(content)
+				n = len(fc.content)
 			}
-			copy(buf, content[:n])
+			copy(buf, fc.content[:n])
 			ctype = http.DetectContentType(buf[:n])
 		}
-		rw.Header().Set("Content-Type", ctype)
 	} else if len(ctypes) > 0 {
 		ctype = ctypes[0]
 	}
 
-	rw.Write(content)
+	rw.Header().Set("Content-Type", ctype)
+
+	rw.Write(fc.content)
 }
 
 // modtime is the modification time of the resource to be served, or IsZero().
@@ -247,4 +271,78 @@ func checkETag(w http.ResponseWriter, r *http.Request) (rangeReq string, done bo
 		}
 	}
 	return rangeReq, false
+}
+
+// httpRange specifies the byte range to be sent to the client.
+type httpRange struct {
+	start, length int64
+}
+
+func (r httpRange) contentRange(size int64) string {
+	return fmt.Sprintf("bytes %d-%d/%d", r.start, r.start+r.length-1, size)
+}
+
+func (r httpRange) mimeHeader(contentType string, size int64) textproto.MIMEHeader {
+	return textproto.MIMEHeader{
+		"Content-Range": {r.contentRange(size)},
+		"Content-Type":  {contentType},
+	}
+}
+
+// parseRange parses a Range header string as per RFC 2616.
+func parseRange(s string, size int64) ([]httpRange, error) {
+	if s == "" {
+		return nil, nil // header not present
+	}
+	const b = "bytes="
+	if !strings.HasPrefix(s, b) {
+		return nil, errors.New("invalid range")
+	}
+	var ranges []httpRange
+	for _, ra := range strings.Split(s[len(b):], ",") {
+		ra = strings.TrimSpace(ra)
+		if ra == "" {
+			continue
+		}
+		i := strings.Index(ra, "-")
+		if i < 0 {
+			return nil, errors.New("invalid range")
+		}
+		start, end := strings.TrimSpace(ra[:i]), strings.TrimSpace(ra[i+1:])
+		var r httpRange
+		if start == "" {
+			// If no start is specified, end specifies the
+			// range start relative to the end of the file.
+			i, err := strconv.ParseInt(end, 10, 64)
+			if err != nil {
+				return nil, errors.New("invalid range")
+			}
+			if i > size {
+				i = size
+			}
+			r.start = size - i
+			r.length = size - r.start
+		} else {
+			i, err := strconv.ParseInt(start, 10, 64)
+			if err != nil || i > size || i < 0 {
+				return nil, errors.New("invalid range")
+			}
+			r.start = i
+			if end == "" {
+				// If no end is specified, range extends to end of the file.
+				r.length = size - r.start
+			} else {
+				i, err := strconv.ParseInt(end, 10, 64)
+				if err != nil || r.start > i {
+					return nil, errors.New("invalid range")
+				}
+				if i >= size {
+					i = size - 1
+				}
+				r.length = i - r.start + 1
+			}
+		}
+		ranges = append(ranges, r)
+	}
+	return ranges, nil
 }
