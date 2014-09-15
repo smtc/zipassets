@@ -3,6 +3,7 @@ package zipassets
 import (
 	"archive/tar"
 	"archive/zip"
+	"bytes"
 	"compress/bzip2"
 	"compress/gzip"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"io"
 	"io/ioutil"
 	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/textproto"
 	"os"
@@ -32,8 +34,14 @@ type ZipAssets struct {
 }
 
 // open zip assets file
-func NewZipAssets(path string) (za *ZipAssets, err error) {
-	za = &ZipAssets{path, make(map[string]*filecontent)}
+func NewZipAssets(path string, args ...interface{}) (handler http.Handler, err error) {
+	if len(args) != 0 {
+		debug, ok := args[0].(bool)
+		if ok && debug == true {
+			return http.FileServer()
+		}
+	}
+	za := &ZipAssets{path, make(map[string]*filecontent)}
 	lowerPath := strings.ToLower(path)
 	if strings.HasSuffix(lowerPath, "zip") {
 		err = openZip(za)
@@ -43,7 +51,7 @@ func NewZipAssets(path string) (za *ZipAssets, err error) {
 		err = openTarBz2(za)
 	}
 
-	return
+	return za, err
 }
 
 // deal with .tar.gz
@@ -171,6 +179,7 @@ func (za *ZipAssets) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	if done {
 		return
 	}
+	code := http.StatusOK
 	// If Content-Type isn't set, use the file's extension to find it, but
 	// if the Content-Type is unset explicitly, do not sniff the type.
 	ctypes, haveType := rw.Header()["Content-Type"]
@@ -196,9 +205,95 @@ func (za *ZipAssets) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		ctype = ctypes[0]
 	}
 
-	rw.Header().Set("Content-Type", ctype)
+	var (
+		size, sendSize int64
+		sendContent    io.Reader = bytes.NewReader(fc.content)
+	)
+	size = int64(len(fc.content))
+	sendSize = size
+	if size >= 0 {
+		ranges, err := parseRange(rangeReq, size)
+		if err != nil {
+			http.Error(rw, err.Error(), http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		if sumRangesSize(ranges) > size {
+			// The total number of bytes in all the ranges
+			// is larger than the size of the file by
+			// itself, so this is probably an attack, or a
+			// dumb client.  Ignore the range request.
+			ranges = nil
+		}
+		switch {
+		case len(ranges) == 1:
+			// RFC 2616, Section 14.16:
+			// "When an HTTP message includes the content of a single
+			// range (for example, a response to a request for a
+			// single range, or to a request for a set of ranges
+			// that overlap without any holes), this content is
+			// transmitted with a Content-Range header, and a
+			// Content-Length header showing the number of bytes
+			// actually transferred.
+			// ...
+			// A response to a request for a single range MUST NOT
+			// be sent using the multipart/byteranges media type."
+			ra := ranges[0]
+			sendSize = ra.length
+			code = http.StatusPartialContent
+			rw.Header().Set("Content-Range", ra.contentRange(size))
+		case len(ranges) > 1:
+			for _, ra := range ranges {
+				if ra.start > size {
+					http.Error(rw, err.Error(), http.StatusRequestedRangeNotSatisfiable)
+					return
+				}
+			}
+			sendSize = rangesMIMESize(ranges, ctype, size)
+			code = http.StatusPartialContent
 
-	rw.Write(fc.content)
+			pr, pw := io.Pipe()
+			mw := multipart.NewWriter(pw)
+			rw.Header().Set("Content-Type", "multipart/byteranges; boundary="+mw.Boundary())
+			sendContent = pr
+			defer pr.Close() // cause writing goroutine to fail and exit if CopyN doesn't finish.
+			go func() {
+				for _, ra := range ranges {
+					part, err := mw.CreatePart(ra.mimeHeader(ctype, size))
+					if err != nil {
+						pw.CloseWithError(err)
+						return
+					}
+					if _, err := io.CopyN(part, bytes.NewReader(fc.content[ra.start:size]), ra.length); err != nil {
+						pw.CloseWithError(err)
+						return
+					}
+					/*
+						if _, err := content.Seek(ra.start, os.SEEK_SET); err != nil {
+							pw.CloseWithError(err)
+							return
+						}
+						if _, err := io.CopyN(part, content, ra.length); err != nil {
+							pw.CloseWithError(err)
+							return
+						}
+					*/
+				}
+				mw.Close()
+				pw.Close()
+			}()
+		}
+
+		rw.Header().Set("Accept-Ranges", "bytes")
+		if rw.Header().Get("Content-Encoding") == "" {
+			rw.Header().Set("Content-Length", strconv.FormatInt(sendSize, 10))
+		}
+	}
+
+	rw.WriteHeader(code)
+	if req.Method != "HEAD" {
+		io.CopyN(rw, sendContent, sendSize)
+	}
+
 }
 
 // modtime is the modification time of the resource to be served, or IsZero().
@@ -345,4 +440,33 @@ func parseRange(s string, size int64) ([]httpRange, error) {
 		ranges = append(ranges, r)
 	}
 	return ranges, nil
+}
+
+// countingWriter counts how many bytes have been written to it.
+type countingWriter int64
+
+func (w *countingWriter) Write(p []byte) (n int, err error) {
+	*w += countingWriter(len(p))
+	return len(p), nil
+}
+
+// rangesMIMESize returns the number of bytes it takes to encode the
+// provided ranges as a multipart response.
+func rangesMIMESize(ranges []httpRange, contentType string, contentSize int64) (encSize int64) {
+	var w countingWriter
+	mw := multipart.NewWriter(&w)
+	for _, ra := range ranges {
+		mw.CreatePart(ra.mimeHeader(contentType, contentSize))
+		encSize += ra.length
+	}
+	mw.Close()
+	encSize += int64(w)
+	return
+}
+
+func sumRangesSize(ranges []httpRange) (size int64) {
+	for _, ra := range ranges {
+		size += ra.length
+	}
+	return
 }
