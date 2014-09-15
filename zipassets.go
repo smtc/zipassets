@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/textproto"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -34,24 +35,38 @@ type ZipAssets struct {
 }
 
 // open zip assets file
-func NewZipAssets(path string, args ...interface{}) (handler http.Handler, err error) {
+func NewZipAssets(pathname string, args ...interface{}) (handler http.Handler, err error) {
 	if len(args) != 0 {
 		debug, ok := args[0].(bool)
 		if ok && debug == true {
-			return http.FileServer()
+			handler = http.FileServer(http.Dir(basename(pathname)))
+			return
 		}
 	}
-	za := &ZipAssets{path, make(map[string]*filecontent)}
-	lowerPath := strings.ToLower(path)
-	if strings.HasSuffix(lowerPath, "zip") {
+	za := &ZipAssets{pathname, make(map[string]*filecontent)}
+	lowerPath := strings.ToLower(pathname)
+	if strings.HasSuffix(lowerPath, ".zip") {
 		err = openZip(za)
-	} else if strings.HasSuffix(lowerPath, "tar.gz") {
+	} else if strings.HasSuffix(lowerPath, ".tar.gz") {
 		err = openTarGz(za)
-	} else if strings.HasSuffix(lowerPath, "tar.bz2") {
+	} else if strings.HasSuffix(lowerPath, ".tar.bz2") {
 		err = openTarBz2(za)
 	}
 
+	if err != nil {
+		// 切换回目录
+		handler = http.FileServer(http.Dir(basename(pathname)))
+		return
+	}
+
 	return za, err
+}
+
+func basename(pathname string) string {
+	dir := path.Dir(pathname)
+	fn := path.Base(pathname)
+
+	return path.Join(dir, strings.SplitN(fn, ".", 2)[0])
 }
 
 // deal with .tar.gz
